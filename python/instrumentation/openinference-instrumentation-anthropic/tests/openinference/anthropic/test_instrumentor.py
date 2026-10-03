@@ -2710,6 +2710,143 @@ async def test_async_streaming_create_as_context_manager_is_recorded(
     assert [block["text"] for block in output["content"]] == texts
 
 
+_TOOL_ARGUMENTS = '{"city": "Chicago", "unit": "celsius"}'
+
+
+def _tool_use_event_stream_handler(request: Any) -> Any:
+    """A tool call streamed with its arguments one character per event."""
+    events: List[Dict[str, Any]] = [
+        {
+            "type": "message_start",
+            "message": {**_MESSAGE_JSON, "content": [], "stop_reason": None},
+        },
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "get_weather",
+                "input": {},
+            },
+        },
+        *(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": char},
+            }
+            for char in _TOOL_ARGUMENTS
+        ),
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+            "usage": {"output_tokens": 10},
+        },
+        {"type": "message_stop"},
+    ]
+    body = "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events)
+    return httpx2.Response(
+        status_code=200, headers={"content-type": "text/event-stream"}, content=body.encode()
+    )
+
+
+def _assert_tool_call_recorded(
+    span: ReadableSpan, arguments: str, token_counts: Dict[str, int]
+) -> None:
+    attributes: Dict[str, Any] = dict(span.attributes or {})
+    assert (
+        attributes[
+            f"{LLM_OUTPUT_MESSAGES}.0.{MESSAGE_TOOL_CALLS}.0.{TOOL_CALL_FUNCTION_ARGUMENTS_JSON}"
+        ]
+        == arguments
+    )
+    assert (
+        attributes[
+            f"{LLM_OUTPUT_MESSAGES}.0.{MESSAGE_CONTENTS}.0.{TOOL_CALL_FUNCTION_ARGUMENTS_JSON}"
+        ]
+        == arguments
+    )
+    assert {
+        key.removeprefix("llm.token_count."): value
+        for key, value in attributes.items()
+        if key.startswith("llm.token_count.")
+    } == token_counts
+
+
+_TOOL_CALL_CASES = [
+    pytest.param(
+        True,
+        _TOOL_ARGUMENTS,
+        {"prompt": 3, "completion": 10, "total": 13},
+        id="exhausted",
+    ),
+    pytest.param(False, '{"city": "Chica', {"prompt": 3}, id="left_early"),
+]
+
+
+@pytest.mark.parametrize("method", ["stream", "create"])
+@pytest.mark.parametrize("exhaust,arguments,token_counts", _TOOL_CALL_CASES)
+def test_stream_left_inside_tool_call_records_arguments_received(
+    method: str,
+    exhaust: bool,
+    arguments: str,
+    token_counts: Dict[str, int],
+    in_memory_span_exporter: InMemorySpanExporter,
+    setup_anthropic_instrumentation: Any,
+) -> None:
+    """
+    Leaving a stream inside a tool call must not record the SDK's partial parse of the arguments
+    received, {} here, as the call the model made, nor output token counts that message_delta
+    never reported (#3904).
+    """
+    client = _mock_anthropic_client(_tool_use_event_stream_handler)
+    if method == "stream":
+        manager: Any = client.messages.stream(**_REQUEST_KWARGS)
+    else:
+        manager = client.messages.create(**_REQUEST_KWARGS, stream=True)
+
+    received = ""
+    with manager as stream:
+        for event in stream:
+            if event.type == "content_block_delta" and event.delta.type == "input_json_delta":
+                received += event.delta.partial_json
+                if not exhaust and len(received) == len(arguments):
+                    break
+
+    assert received == arguments
+    _assert_tool_call_recorded(_get_span(in_memory_span_exporter), arguments, token_counts)
+
+
+@pytest.mark.parametrize("method", ["stream", "create"])
+@pytest.mark.parametrize("exhaust,arguments,token_counts", _TOOL_CALL_CASES)
+async def test_async_stream_left_inside_tool_call_records_arguments_received(
+    method: str,
+    exhaust: bool,
+    arguments: str,
+    token_counts: Dict[str, int],
+    in_memory_span_exporter: InMemorySpanExporter,
+    setup_anthropic_instrumentation: Any,
+) -> None:
+    client = _mock_async_anthropic_client(_tool_use_event_stream_handler)
+    if method == "stream":
+        manager: Any = client.messages.stream(**_REQUEST_KWARGS)
+    else:
+        manager = await client.messages.create(**_REQUEST_KWARGS, stream=True)
+
+    received = ""
+    async with manager as stream:
+        async for event in stream:
+            if event.type == "content_block_delta" and event.delta.type == "input_json_delta":
+                received += event.delta.partial_json
+                if not exhaust and len(received) == len(arguments):
+                    break
+
+    assert received == arguments
+    _assert_tool_call_recorded(_get_span(in_memory_span_exporter), arguments, token_counts)
+
+
 def test_exception_leaving_streaming_create_context_is_recorded(
     in_memory_span_exporter: InMemorySpanExporter,
     setup_anthropic_instrumentation: Any,

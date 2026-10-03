@@ -44,7 +44,7 @@ class _RawStreamInterceptor(ObjectProxy):  # type: ignore[misc,name-defined,type
     gives us the complete ParsedMessage at the end.
     """
 
-    __slots__ = ("_self_with_span", "_self_message_stream")
+    __slots__ = ("_self_with_span", "_self_message_stream", "_self_progress")
 
     def __init__(
         self,
@@ -55,10 +55,12 @@ class _RawStreamInterceptor(ObjectProxy):  # type: ignore[misc,name-defined,type
         super().__init__(raw_stream)
         self._self_with_span = with_span
         self._self_message_stream = message_stream
+        self._self_progress = _StreamProgress()
 
     def __iter__(self) -> Iterator["RawMessageStreamEvent"]:
         try:
             for item in self.__wrapped__:
+                self._self_progress.process_event(item)
                 yield item
         except Exception as exception:
             self._self_with_span.record_exception(exception)
@@ -74,6 +76,7 @@ class _RawStreamInterceptor(ObjectProxy):  # type: ignore[misc,name-defined,type
     async def __aiter__(self) -> AsyncIterator["RawMessageStreamEvent"]:
         try:
             async for item in self.__wrapped__:
+                self._self_progress.process_event(item)
                 yield item
         except Exception as exception:
             self._self_with_span.record_exception(exception)
@@ -95,7 +98,7 @@ class _RawStreamInterceptor(ObjectProxy):  # type: ignore[misc,name-defined,type
                 pass
         _finish_tracing(
             with_span=self._self_with_span,
-            has_attributes=_MessageExtractor(snapshot),
+            has_attributes=_MessageExtractor(snapshot, self._self_progress),
             status=status,
         )
 
@@ -219,7 +222,9 @@ class _MessagesStream(ObjectProxy):  # type: ignore[misc,name-defined,type-arg,u
     ) -> None:
         _finish_tracing(
             with_span=self._with_span,
-            has_attributes=_MessageExtractor(self._response_accumulator._result()),
+            has_attributes=_MessageExtractor(
+                self._response_accumulator._result(), self._response_accumulator._progress
+            ),
             status=status,
         )
 
@@ -227,7 +232,7 @@ class _MessagesStream(ObjectProxy):  # type: ignore[misc,name-defined,type-arg,u
 class _MessageResponseAccumulator:
     """Accumulates raw SSE events into a ParsedMessage using the SDK's own accumulate_event."""
 
-    __slots__ = ("_is_beta", "_request_headers", "_snapshot", "_json_bufs")
+    __slots__ = ("_is_beta", "_request_headers", "_snapshot", "_json_bufs", "_progress")
 
     def __init__(
         self,
@@ -241,8 +246,10 @@ class _MessageResponseAccumulator:
         # Buffers partial tool-use input JSON across events, keyed by content block
         # index.
         self._json_bufs: Dict[int, bytes] = {}
+        self._progress = _StreamProgress()
 
     def process_chunk(self, chunk: "RawMessageStreamEvent") -> None:
+        self._progress.process_event(chunk)
         # Beta and stable chunks need their matching accumulate_event; beta's
         # raises on stable chunks and vice versa silently drops updates.
         if self._is_beta:
@@ -276,6 +283,41 @@ class _MessageResponseAccumulator:
         return self._snapshot
 
 
+class _StreamProgress:
+    """
+    Tracks how far a stream got, which the SDK's snapshot does not tell apart from a finished
+    message: a tool call cut off mid-arguments holds only the input that parses so far (e.g. {}
+    for '{"city": "Chica'), and usage keeps message_start's output tokens until message_delta
+    brings the final count.
+    """
+
+    __slots__ = ("unfinished_inputs", "has_final_usage")
+
+    def __init__(self) -> None:
+        # Raw input JSON received so far for content blocks not yet stopped, by block index.
+        self.unfinished_inputs: Dict[int, str] = {}
+        self.has_final_usage = False
+
+    def process_event(self, event: Any) -> None:
+        try:
+            if event.type == "content_block_start":
+                self.unfinished_inputs[event.index] = ""
+            elif event.type == "content_block_delta" and event.delta.type == "input_json_delta":
+                self.unfinished_inputs[event.index] += event.delta.partial_json
+            elif event.type == "content_block_stop":
+                self.unfinished_inputs.pop(event.index, None)
+            elif event.type == "message_delta":
+                self.has_final_usage = True
+        except Exception:
+            pass
+
+
+_OUTPUT_TOKEN_COUNTS = (
+    SpanAttributes.LLM_TOKEN_COUNT_COMPLETION,
+    SpanAttributes.LLM_TOKEN_COUNT_TOTAL,
+)
+
+
 class _MessageExtractor:
     """
     Extracts span attributes from a ParsedMessage (or Message) snapshot.
@@ -283,13 +325,15 @@ class _MessageExtractor:
     and the messages.create(stream=True) path (via _MessageResponseAccumulator).
     """
 
-    __slots__ = ("_snapshot",)
+    __slots__ = ("_snapshot", "_progress")
 
-    def __init__(self, snapshot: Any) -> None:
+    def __init__(self, snapshot: Any, progress: Optional[_StreamProgress] = None) -> None:
         self._snapshot = snapshot
+        self._progress = progress
 
     def get_attributes(self) -> Iterator[Tuple[str, AttributeValue]]:
         snapshot = self._snapshot
+        progress = self._progress
         if snapshot is None:
             return
         yield SpanAttributes.OUTPUT_VALUE, snapshot.model_dump_json()
@@ -342,6 +386,11 @@ class _MessageExtractor:
                     block.data,
                 )
             elif block.type == "tool_use":
+                arguments = safe_json_dumps(block.input)
+                if progress and block_idx in progress.unfinished_inputs:
+                    # the stream ended inside this tool call, so record the arguments received
+                    # rather than the partial parse, which reads as a complete call
+                    arguments = progress.unfinished_inputs[block_idx]
                 yield (
                     f"{SpanAttributes.LLM_OUTPUT_MESSAGES}.0.{MessageAttributes.MESSAGE_TOOL_CALLS}.{tool_idx}.{ToolCallAttributes.TOOL_CALL_ID}",
                     block.id,
@@ -352,7 +401,7 @@ class _MessageExtractor:
                 )
                 yield (
                     f"{SpanAttributes.LLM_OUTPUT_MESSAGES}.0.{MessageAttributes.MESSAGE_TOOL_CALLS}.{tool_idx}.{ToolCallAttributes.TOOL_CALL_FUNCTION_ARGUMENTS_JSON}",
-                    safe_json_dumps(block.input),
+                    arguments,
                 )
                 yield (
                     f"{content_prefix}.{MessageContentAttributes.MESSAGE_CONTENT_TYPE}",
@@ -368,7 +417,11 @@ class _MessageExtractor:
                 )
                 yield (
                     f"{content_prefix}.{ToolCallAttributes.TOOL_CALL_FUNCTION_ARGUMENTS_JSON}",
-                    safe_json_dumps(block.input),
+                    arguments,
                 )
                 tool_idx += 1
-        yield from _get_token_counts(snapshot.usage)
+        for key, value in _get_token_counts(snapshot.usage):
+            if progress and not progress.has_final_usage and key in _OUTPUT_TOKEN_COUNTS:
+                # the stream ended before message_delta reported the output tokens
+                continue
+            yield key, value
